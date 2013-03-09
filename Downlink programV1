@@ -1,0 +1,123 @@
+/*This program is designed to take the data being received via the ublox Max-6 gps breakout module
+and transmit it through the arduino uno and out of the NTX2 transmitter*/
+
+#include <stdio.h>                //Includes standard input output header file
+#include <TinyGPS_UBX.h>          //Includes TinyGPS uBlox edition header file
+#include <SoftwareSerial.h>       //Includes Software Serial header file
+
+/*Includes CRC header file which contains optimized inline functions. 
+These are used for calculating cyclic redundancy checks e.g. error detection*/
+#include <util/crc16.h>          
+
+/*ID's Arduino pin 13 as RADIOTX, from now on RADIOTX functions refer to pin 13. 
+In addition this pin is connected to a board mounted LED that shows when the pin is high or low*/
+#define RADIOTX 13                
+
+TinyGPS gps;                      
+SoftwareSerial SoSe(4, 5);        //When calling upon SoftwareSerial.h, named SoSe and function assigned to pins 4 and 5
+byte gps_set_sucess = 0 ;
+
+
+void setup()
+{
+      Serial.begin(9600);                               //Starts serial monitor at 9600 Baud
+      SoSe.begin(9600);                                 //Starts software serial at 9600 Baud
+      Serial.print("Initiating Configuration... ");     //Prints a display message into the Serial monitor to show program is running
+      SoSe.print("$PUBX,41,1,0007,0003,4800,0*13\r\n"); //Sets the protocols and Baud rate of GPS to 4800; Page 81 of the uBlox-6 Protocol manual
+      SoSe.begin(4800);                                 //Sets software serial to 4800 Baud
+      SoSe.flush();                                     //Flushes the Serial line so that it is ready for input/output
+      
+      delay(3000);                                      //Delay of 3 seconds allows GPS to complete changes
+      
+      /*These commands disengage the other GPS modes available on this chip, leaving only the basic NMEA data required
+      This method does not perform an acknowledgement to the user*/
+      Serial.println("$PUBX,40,GLL,0,0,0,0*5C");        //GLL page 56, Latitude and longitude, with time of position fix and status
+      Serial.println("$PUBX,40,GGA,0,0,0,0*5A");        //UNSURE WHY THIS IS BEING DEACTIVATED AT THIS STAGE, $GPGGA IS SURELY WHAT WE WANT?       
+      Serial.println("$PUBX,40,GSA,0,0,0,0*4E");        //GSA page 59, GNSS DOP and Active Satellites
+      Serial.println("$PUBX,40,RMC,0,0,0,0*47");        //RMC page 62, Recommended Minimum data
+      Serial.println("$PUBX,40,GSV,0,0,0,0*59");        //GSV page 61, GNSS Satellites in View
+      Serial.println("$PUBX,40,VTG,0,0,0,0*5E");        //VTG page 64, Course over ground and Ground speed
+      
+      delay(3000);                                      //Further delay of 3 seconds allowing GPS to change settings
+      
+      pinMode(RADIOTX, OUTPUT);                         //Previously defined RADIOTX pin set to output mode
+      
+      /*This element switches the GPS to "airborne 1G" mode to allow for co-ordinates above 12km*/
+      Serial.println("Switching GPS to flight mode: ");
+      uint8_t setNav[] = {0xB5, 0x62, 0x06, 0x24, 0x24, 0x00, 0xFF, 0xFF, 0x06, 0x03, 0x00, 0x00, 0x00, 0x00, 0x10, 0x27, 0x00, 0x00, 0x05, 0x00, 0xFA, 0x00, 0xFA, 0x00, 0x64, 0x00, 0x2C, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0xDC};
+      while(!gps_set_sucess)
+      {
+            sendUBX(setNav, sizeof(setNav)/sizeof(uint8_t));
+            gps_set_sucess=getUBX_ACK(setNav);
+      }
+      gps_set_sucess=0;
+
+}
+
+//
+//INSERT
+//GPS LOOP
+//RECEIVE
+//ELEMENT
+//HERE
+//
+
+
+/* Function to sent a char at a time to rttyTXbyte subroutine*/
+void rttyTXstring (char *string)              //Can't send a character to a function, * key indicates a pointer. Pointer points to the variable
+{
+      char c;                                 //Character is named c, Characters have a number range of -128 to 127
+      c = *string++;                          //c Points at the string and increments
+      while ( c != '\0')                      //When c is not 0
+      {
+              rttyTXbyte (c);      
+              c = *string++;                  //A string is defined as an array of characters
+      }
+}
+ 
+/* Function handles the received character from rttyTXstring and processes it for rttyTXbit*/ 
+void rttyTXbyte (char c)                      //One byte = 8 bits
+{
+      int i;                                  //Interger is named i
+      rttyTXbit (0);                          //Starts bit from lowest significant bit first (little endian mode)  
+ 
+      for (i=0;i<7;i++)                       //Repeats the subfunction below 7 times, or when using 8-ASCII this is changed to 8. (Increments 1 each time)
+      {
+              if (c & 1) rttyTXbit(1);         
+              else rttyTXbit(0);	
+              c = c >> 1;                     //Bitshift data right one
+ 
+      }
+ 
+      rttyTXbit (1);                          //Stop bit
+      rttyTXbit (1);                          //Stop bit
+}
+
+/* Function then receives the assembled data from rttyTXbyte and sends it to the designated output pin*/ 
+void rttyTXbit (int bit)
+{
+      if (bit)
+      {
+              digitalWrite(RADIOTX, HIGH);    //If data is a binary 1, Makes RADIOTX high, LED also activates
+      }
+      
+      else
+      {
+              digitalWrite(RADIOTX, LOW);     //If data is a binary 0, Makes RADIOTX low, LED deactivates
+ 
+      }
+      delayMicroseconds(10000);               //Due to Arduino clock sensitivity a single delay above 16383 microseconds
+      delayMicroseconds(10150);               //Therefore the delay is divided into two, providing a combined delay of 20105 required for 50 Baud
+                                              //Info Available at: http://arduino.cc/en/Reference/DelayMicroseconds 
+}
+
+// calc CRC-CCITT (0xFFFF)
+//Datastring CRC16 Checksum Mechanism from Lunar_Lander
+uint16_t crccat(char *msg)                    
+{
+      uint16_t x;                             //unit16_t is assigned as x
+      for(x = 0xFFFF; *msg; msg++)
+      x = _crc_xmodem_update(x, *msg);
+      snprintf(msg, 8, "*%04Xn", x);          //snprintf stores the data in the array buffer, similar to the sprintf function however n denotes the maximum number of characters
+      return(x);
+}
