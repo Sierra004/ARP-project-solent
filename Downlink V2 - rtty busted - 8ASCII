@@ -1,0 +1,250 @@
+/*This program is designed to take the data being received via the ublox Max-6 gps breakout module
+and transmit it through the arduino uno and out of the NTX2 transmitter*/
+
+#include <stdio.h>                //Includes standard input output header file
+#include <TinyGPS.h>              //Includes TinyGPS uBlox edition header file
+#include <SoftwareSerial.h>       //Includes Software Serial header file, THIS NEEDS MODIFYING, BUFFER SIZE EXTENDING FROM 64 TO 128
+
+/*Includes CRC header file which contains optimized inline functions. 
+These are used for calculating cyclic redundancy checks e.g. error detection*/
+#include <util/crc16.h>          
+
+/*ID's Arduino pin 13 as RADIOTX, from now on RADIOTX functions refer to pin 13. 
+In addition this pin is connected to a board mounted LED that shows when the pin is high or low*/
+#define RADIOTX 13                
+
+TinyGPS gps;                      
+SoftwareSerial SoSe(4, 5);        //When calling upon SoftwareSerial.h, named SoSe and function assigned to pins 4 and 5
+byte gps_set_sucess = 0 ;
+
+/*Below are some defined variables in which to store the GPS data, these are standard for UKHAS*/
+unsigned long date, time, age;                                                                       //unsigned long: 4 bytes, range of 0 to 4,294,967,925
+int hour, minute, second, Satellites, iteration = 1, transmitCheck;                                  //integer: 2 bytes, range of -32,768 to 32767
+long int gpsAltitude;
+char latitudeBuffer[16], longitudeBuffer[16], timeBuffer[] = "00:00:00", transmitBuffer[128];        //character: 1 byte, range of -128 to 127 (transmitBuffer is extended to 128 to assist with timing on the arduino)
+float floatLatitude, floatLongitude;                                                                 //float: 4 bytes, range of -3.4028235E+38 to 3.4028235E+38
+
+void setup()
+{
+      Serial.begin(9600);                               //Starts serial monitor at 9600 Baud, used for debuging on the IDE serial monitor
+      SoSe.begin(9600);                                 //Starts software serial at 9600 Baud
+      Serial.print("Initiating Configuration... ");     //Prints a display message into the Serial monitor to show program is running
+      SoSe.print("$PUBX,41,1,0007,0003,4800,0*13\r\n"); //Sets the protocols and Baud rate of GPS to 4800; Page 81 of the uBlox-6 Protocol manual
+      SoSe.begin(4800);                                 //Sets software serial to 4800 Baud
+      SoSe.flush();                                     //Flushes the Serial line so that it is ready for input/output
+      
+      delay(2000);                                      //Delay of 3 seconds allows GPS to complete changes
+      
+      /*These commands disengage the other GPS modes available on this chip, leaving only the basic NMEA data required
+      This method does not perform an acknowledgement to the user. Delays allow the actions to complete*/
+      Serial.println("$PUBX,40,GLL,0,0,0,0*5C");        //GLL page 56, Latitude and longitude, with time of position fix and status
+      delay(500);
+      Serial.println("$PUBX,40,GGA,0,0,0,0*5A");        //UNSURE WHY THIS IS BEING DEACTIVATED AT THIS STAGE, $GPGGA IS SURELY WHAT WE WANT?
+      delay(500);      
+      Serial.println("$PUBX,40,GSA,0,0,0,0*4E");        //GSA page 59, GNSS DOP and Active Satellites
+      delay(500);
+      Serial.println("$PUBX,40,RMC,0,0,0,0*47");        //RMC page 62, Recommended Minimum data
+      delay(500);
+      Serial.println("$PUBX,40,GSV,0,0,0,0*59");        //GSV page 61, GNSS Satellites in View
+      delay(500);
+      Serial.println("$PUBX,40,VTG,0,0,0,0*5E");        //VTG page 64, Course over ground and Ground speed
+      
+      delay(2500);                                      //Further delay of 2 seconds allowing GPS to change settings
+      
+      pinMode(RADIOTX, OUTPUT);                         //Previously defined RADIOTX pin set to output mode
+      
+      /*This element switches the GPS to "airborne 1G" mode to allow for co-ordinates above 12km*/
+      Serial.println("Switching GPS to flight mode: ");
+      uint8_t setNav[] = {0xB5, 0x62, 0x06, 0x24, 0x24, 0x00, 0xFF, 0xFF, 0x06, 0x03, 0x00, 0x00, 0x00, 0x00, 0x10, 0x27, 0x00, 0x00, 0x05, 0x00, 0xFA, 0x00, 0xFA, 0x00, 0x64, 0x00, 0x2C, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0xDC};
+      while(!gps_set_sucess)
+      {
+            sendUBX(setNav, sizeof(setNav)/sizeof(uint8_t));
+            gps_set_sucess=getUBX_ACK(setNav);
+      }
+      gps_set_sucess=0;
+
+}
+
+void loop() 
+{
+      SoSe.print("$PUBX,00*33\r\n");    //Request an NMEA sentence from GPS
+
+      //GPS does not respond immediately, so give it 1.5 seconds
+      //This is also the delay between NMEA sentences
+      delay(1500);
+
+      while (SoSe.available() > 0) 
+      {
+
+            //Pass TinyGPS object each character recieved from the GPS and encode
+            int checkNMEASentence = gps.encode(SoSe.read());
+
+            //Only if TinyGPS has received a complete NMEA sentence
+            if (checkNMEASentence > 0) 
+            {
+
+                  //Query the TinyGPS object for the number of satellites
+                  Satellites = gps.satellites();
+
+                  //Query the TinyGPS object for the date, time and age
+                  gps.get_datetime(&date, &time, &age);
+
+                  //Convert the time to something useful
+                  hour = (time / 1000000);
+                  minute = ((time - (hour * 1000000)) / 10000);
+                  second = ((time - ((hour * 1000000) + (minute * 10000))));
+                  second = second / 100;
+
+                  //Get Position
+                  gps.f_get_position(&floatLatitude, &floatLongitude);
+
+                  //Convert float to string
+                  dtostrf(floatLatitude, 7, 4, latitudeBuffer);
+                  dtostrf(floatLongitude, 7, 4, longitudeBuffer);
+
+                  //Check that we are putting a +sign where applicable at the front of lonbuf
+                  if(longitudeBuffer[0] == ' ')
+                  {
+                        longitudeBuffer[0] = '+';
+                  }
+
+                  //Convert altitude to metres
+                  gpsAltitude = (gps.altitude() / 100);
+
+                  //Construct the transmit buffer
+                  sprintf(transmitBuffer, "$$ARP,%d,%02d:%02d:%02d,%s,%s,%ld,%d", iteration, hour, minute, second, latitudeBuffer, longitudeBuffer, gpsAltitude, Satellites);
+        
+                  //Append the CRC16 checksum to the end of the transmit buffer
+                  sprintf(transmitBuffer, "%s*%04X\n", transmitBuffer, CRCChecksum(transmitBuffer));
+
+                  //Pass the transmit buffer to the RTTY function
+                  rttyTXstring(transmitBuffer);
+        
+                  //Increase the iteration counter by one
+                  iteration++;
+            }
+      }
+}
+
+/*The send and getUBX elements are edited versions of the test code available here: http://ukhas.org.uk/guides:ublox6*/
+void sendUBX(uint8_t *MSG, uint8_t len) // Send a byte array of UBX protocol to the GPS
+{ 
+      for(int i=0; i<len; i++) 
+      { 
+            SoSe.write(MSG[i]);
+      }
+}
+
+
+boolean getUBX_ACK(uint8_t *MSG) // Calculate expected UBX ACK packet and parse UBX response from GPS, a boolean function is either true or false (1 or 0) its use saves memory
+{
+      uint8_t b;
+      uint8_t ackByteID = 0;
+      uint8_t ackPacket[10];
+      unsigned long startTime = millis();
+      
+      // Construct the expected ACK packet
+      ackPacket[0] = 0xB5;    // header
+      ackPacket[1] = 0x62;	  // header
+      ackPacket[2] = 0x05;	  // class
+      ackPacket[3] = 0x01;	  // id
+      ackPacket[4] = 0x02;	  // length
+      ackPacket[5] = 0x00;
+      ackPacket[6] = MSG[2];	  // ACK class
+      ackPacket[7] = MSG[3];	  // ACK id
+      ackPacket[8] = 0;	          // CK_A
+      ackPacket[9] = 0;	          // CK_B
+
+      for (uint8_t i=2; i<8; i++) // Calculate the checksums
+      { 
+            ackPacket[8] = ackPacket[8] + ackPacket[i];
+            ackPacket[9] = ackPacket[9] + ackPacket[8];
+      }
+      while (1) 
+      {
+            if (ackByteID > 9)                    // Test for success
+            {
+            Serial.println(" (SUCCESS!)");        // All packets in order!
+            return true;
+            }
+            if (millis() - startTime > 3000)      // Timeout if no valid response in 3 seconds
+            {
+            Serial.println(" (FAILED!)"); 
+            return false;
+            }
+            if (SoSe.available())                 // Make sure data is available to read
+            { 
+                  b = SoSe.read();
+                  if (b == ackPacket[ackByteID])  // Check that bytes arrive in sequence as per expected ACK packet
+                  {
+                        ackByteID++;              //ackByteID is then incremented and read again
+                  }
+                  else 
+                  {
+                        ackByteID = 0;            // Reset and look again, invalid order
+                  }
+            }
+      }
+}
+
+/* Function to sent a char at a time to rttyTXbyte subroutine*/
+void rttyTXstring (char *string)              //Can't send a character to a function, * key indicates a pointer. Pointer points to the variable
+{
+      char c;                                 //Character is named c, Characters have a number range of -128 to 127
+      c = *string++;                          //c Points at the string and increments
+      while ( c != '\0')                      //When c is not 0
+      {
+              rttyTXbyte (c);      
+              c = *string++;                  //A string is defined as an array of characters
+      }
+}
+ 
+/* Function handles the received character from rttyTXstring and processes it for rttyTXbit*/ 
+void rttyTXbyte (char c)                      //One byte = 8 bits
+{
+      int i;                                  //Interger is named i
+      rttyTXbit (0);                          //Starts bit from lowest significant bit first (little endian mode)	
+ 
+      for (i=0;i<8;i++)                       //Repeats the subfunction below 7 times, or when using 8-ASCII this is changed to 8. (Increments 1 each time)
+      {
+              if (c & 1) rttyTXbit(1);         
+              else rttyTXbit(0);	
+              c = c >> 1;                     //Bitshift data right one
+ 
+      }
+ 
+      rttyTXbit (1);                          //Stop bit
+      rttyTXbit (1);                          //Stop bit
+}
+
+/* Function then receives the assembled data from rttyTXbyte and sends it to the designated output pin*/ 
+void rttyTXbit (int bit)
+{
+      if (bit)
+      {
+              digitalWrite(RADIOTX, HIGH);    //If data is a binary 1, Makes RADIOTX high, LED also activates
+      }
+      
+      else
+      {
+              digitalWrite(RADIOTX, LOW);     //If data is a binary 0, Makes RADIOTX low, LED deactivates
+ 
+      }
+      delayMicroseconds(10000);               //Due to Arduino clock sensitivity a single delay above 16383 microseconds
+      delayMicroseconds(10150);               //Therefore the delay is divided into two, providing a combined delay of 20105 required for 50 Baud
+                                              //Info Available at: http://arduino.cc/en/Reference/DelayMicroseconds 
+}
+
+uint16_t CRCChecksum(char *string) // CRC16 checksum function
+{
+      size_t i; // This code was adapted from http://ukhas.org.uk/communication:protocol
+      uint16_t crc;
+      uint8_t c;
+      crc = 0xFFFF;
+      for (i = 2; i < strlen(string); i++) // Calculate checksum ignoring the first two $s
+      {
+              c = string[i];
+              crc = _crc_xmodem_update (crc, c);
+      }
+      return crc;
+}
